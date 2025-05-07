@@ -1,0 +1,65 @@
+# docker-compose.yml
+services:
+  data_ingestion_zone:
+    build: .
+    container_name: data_ingestion
+    environment:
+      - ZONE_NAME=data_ingestion_zone
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./logs:/app/logs
+      - ./grib_csv_data_wind:/app/data_to_send:ro
+      - ./schedule.json:/app/schedule.json:ro
+    command: python zone_agent.py
+    networks:
+      - scada_net
+    depends_on:
+      - forecast_processing_zone # So server is likely up
+
+  forecast_processing_zone:
+    build: .
+    container_name: forecast_processing
+    environment:
+      - ZONE_NAME=forecast_processing_zone
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./logs:/app/logs
+      - ./schedule.json:/app/schedule.json:ro
+      # No need to mount /app/data_to_send here as it gets data from upstream
+    command: python zone_agent.py
+    networks:
+      - scada_net
+    depends_on:
+      - operational_control_zone
+
+  operational_control_zone:
+    build: .
+    container_name: operational_control
+    environment:
+      - ZONE_NAME=operational_control_zone
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./logs:/app/logs
+      - ./schedule.json:/app/schedule.json:ro
+    command: python zone_agent.py
+    networks:
+      - scada_net
+    depends_on:
+      - scada_presentation_zone
+
+  scada_presentation_zone:
+    build: .
+    container_name: scada_presentation
+    environment:
+      - ZONE_NAME=scada_presentation_zone
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./logs:/app/logs
+      - ./schedule.json:/app/schedule.json:ro
+    command: python zone_agent.py # Will only run its server part
+    networks:
+      - scada_net
+
+networks:
+  scada_net:
+    driver: bridge
