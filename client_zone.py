@@ -1,194 +1,189 @@
+# This code is intended to be part of zone_agent.py
+
 import socket
 import json
 import time
 import os
 import datetime
 import random
+import queue # For internal data queue if this client is part of a server_client agent
+from zone_agent import log_lock # Assuming log_lock is defined in zone_agent.py
+from zone_agent import log_event # Assuming log_event is defined in zone_agent.py
 
-LOG_FILE = "/app/logs/simulation.log"
-SCHEDULE_FILE = "schedule.json"
-DATA_FILES_DIR_IN_CONTAINER = "/app/data_to_send" # e.g., wind CSVs
+# --- Constants (ensure these are defined or passed appropriately in zone_agent.py) ---
+# LOG_FILE = "/app/logs/simulation.log" (defined in zone_agent.py)
+# SCHEDULE_FILE = "schedule.json" (defined in zone_agent.py)
+DATA_FILES_DIR_IN_CONTAINER = "/app/data_to_send" # For data_ingestion_zone specifically
 
 BUFFER_SIZE = 1024
 CONNECTION_TIMEOUT = 3
-REGULAR_SEND_INTERVAL = 5 # Seconds between normal send attempts
-ROGUE_ATTEMPT_PROBABILITY = 0.2 # 20% chance each cycle to also make a rogue attempt
-TOTAL_DURATION = 240 # Run client for longer to see more events
+CLIENT_REGULAR_SEND_INTERVAL = 5
+CLIENT_ROGUE_ATTEMPT_PROBABILITY = 0.3 # Higher for more visible rogue events
+CLIENT_TOTAL_DURATION = 300
 
-def log_event(log_data):
-    log_data["timestamp_iso"] = datetime.datetime.now().isoformat()
-    try:
-        with open(LOG_FILE, "a") as f:
-            f.write(json.dumps(log_data) + "\n")
-    except Exception as e:
-        print(f"[ERROR][{os.getenv('ZONE_NAME', 'unknown')}] Logging failed: {e}")
+# log_event function (defined in zone_agent.py and uses log_lock)
+# def log_event(log_data): ...
 
-def get_available_data_files():
-    if not os.path.exists(DATA_FILES_DIR_IN_CONTAINER):
-        return []
-    try:
-        return [f for f in os.listdir(DATA_FILES_DIR_IN_CONTAINER) if os.path.isfile(os.path.join(DATA_FILES_DIR_IN_CONTAINER, f))]
-    except Exception:
-        return []
+# --- Client Component Functions ---
 
-def attempt_send(zone_name, target_zone, target_host, target_port, rule, chunk_id, payload_ref, payload_size, content_type, is_rogue_attempt=False):
-    """Handles a single send attempt, legitimate or rogue."""
+def get_initial_data_files_for_ingestion(zone_name_for_client):
+    if zone_name_for_client == "data_ingestion_zone":
+        if not os.path.exists(DATA_FILES_DIR_IN_CONTAINER):
+            print(f"[{zone_name_for_client}/C] Initial data directory not found: {DATA_FILES_DIR_IN_CONTAINER}", flush=True)
+            return []
+        try:
+            files = [f for f in os.listdir(DATA_FILES_DIR_IN_CONTAINER) if os.path.isfile(os.path.join(DATA_FILES_DIR_IN_CONTAINER, f))]
+            print(f"[{zone_name_for_client}/C] Found {len(files)} initial data files.", flush=True)
+            return files
+        except Exception as e:
+            print(f"[{zone_name_for_client}/C] Error listing initial data files: {e}", flush=True)
+            return []
+    return []
+
+
+def client_attempt_send(zone_name_for_client, target_zone, target_host, target_port, rule_for_path,
+                        message_id, payload_ref, payload_size, content_type, is_rogue_attempt):
+    # Passed log_event implicitly as it's global in this script
     now = datetime.datetime.now()
     current_second = now.second
+    is_path_actually_open_by_schedule = False
+    log_event_base_info = {
+        "zone": zone_name_for_client, "event_context": "client", "destination": target_zone,
+        "message_id": message_id, "payload_reference": payload_ref,
+        "is_rogue_attempt": is_rogue_attempt, "current_second": current_second,
+        "scheduled_window_for_path": f"{rule_for_path.get('start_sec','N/A')}-{rule_for_path.get('end_sec','N/A')-1}" if rule_for_path else "N/A"
+    }
+
+    if rule_for_path:
+        start_sec, end_sec = rule_for_path.get("start_sec",0), rule_for_path.get("end_sec",60)
+        is_path_actually_open_by_schedule = start_sec <= current_second < end_sec
     
-    # Time window check applies to BOTH legitimate and rogue attempts
-    # A rogue attempt is only "successful" if it happens to fall within an existing open window
-    is_time_allowed_by_schedule = False
-    if rule: # rule might be None if target is not defined for this client
-        start_sec = rule.get("start_sec", 0)
-        end_sec = rule.get("end_sec", 60) # Default to always open if rule incomplete (should not happen with good schedule)
-        is_time_allowed_by_schedule = start_sec <= current_second < end_sec
-    else: # No rule for this client to send, so any attempt is effectively unscheduled
-        is_time_allowed_by_schedule = False
-
-
+    log_event_base_info["path_open_by_schedule"] = is_path_actually_open_by_schedule
     event_prefix = "Rogue" if is_rogue_attempt else ""
     log_event_type_attempt = f"{event_prefix}AttemptSend"
 
-    print(f"[{zone_name}] {log_event_type_attempt} chunk {chunk_id} (Ref: {payload_ref}). Time: {now.strftime('%H:%M:%S')} ({current_second}s). AllowedBySched: {is_time_allowed_by_schedule}")
+    print(f"[{zone_name_for_client}/C] {log_event_type_attempt} ID {message_id} (Ref: {payload_ref[:30]}...). PathOpenSched: {is_path_actually_open_by_schedule}", flush=True)
+    log_event({**log_event_base_info, "timestamp": time.time(), "event": log_event_type_attempt,
+               "payload_size_bytes": payload_size, "payload_content_type": content_type})
 
-    log_data_base = {
-        "timestamp": time.time(),
-        "zone": zone_name,
-        "destination": target_zone,
-        "destination_host": target_host,
-        "destination_port": target_port,
-        "chunk_id": chunk_id,
-        "current_second": current_second,
-        "allowed_window_config": f"{rule.get('start_sec', 'N/A')}-{rule.get('end_sec', 'N/A')-1}" if rule else "N/A",
-        "time_allowed_by_schedule": is_time_allowed_by_schedule,
-        "payload_reference": payload_ref,
-        "payload_size_bytes": payload_size,
-        "payload_content_type": content_type,
-        "is_rogue_attempt": is_rogue_attempt
-    }
-    log_event({**log_data_base, "event": log_event_type_attempt})
-
-    if is_time_allowed_by_schedule: # Path is open according to schedule
+    if is_path_actually_open_by_schedule:
         try:
             start_conn_time = time.time()
             with socket.create_connection((target_host, target_port), timeout=CONNECTION_TIMEOUT) as sock:
-                end_conn_time = time.time()
-                conn_latency_ms = (end_conn_time - start_conn_time) * 1000
-
-                message_payload = {
-                    "source_zone": zone_name, "chunk_id": chunk_id, "send_timestamp": time.time(),
+                conn_latency_ms = (time.time() - start_conn_time) * 1000
+                network_payload = {
+                    "source_zone": zone_name_for_client, "message_id": message_id,
+                    "send_timestamp_utc": datetime.datetime.utcnow().isoformat(),
                     "data_reference": payload_ref, "data_size_bytes": payload_size,
                     "content_type": content_type, "is_rogue": is_rogue_attempt
                 }
-                message_bytes = json.dumps(message_payload).encode('utf-8')
-                sock.sendall(message_bytes)
+                sock.sendall(json.dumps(network_payload).encode('utf-8'))
                 ack = sock.recv(BUFFER_SIZE)
-                end_ack_time = time.time()
-                rtt_ms = (end_ack_time - start_conn_time) * 1000
-
+                round_trip_latency_ms = (time.time() - start_conn_time) * 1000
                 if ack == b'ACK':
-                    log_event_type_success = f"{event_prefix}SendSuccess"
-                    print(f"[{zone_name}] {log_event_type_success} chunk {chunk_id} to {target_zone}. RTT: {rtt_ms:.2f} ms")
-                    log_event({**log_data_base, "event": log_event_type_success, "conn_latency_ms": conn_latency_ms, "round_trip_latency_ms": rtt_ms})
+                    event_type_outcome = f"{event_prefix}SendSuccess"
+                    log_event({**log_event_base_info, "timestamp": time.time(), "event": event_type_outcome,
+                               "conn_latency_ms": conn_latency_ms, "round_trip_latency_ms": round_trip_latency_ms})
                 else:
-                    log_event({**log_data_base, "event": f"{event_prefix}SendFail_BadAck"})
+                    log_event({**log_event_base_info, "timestamp": time.time(), "event": f"{event_prefix}SendFail_BadAck"})
         except socket.timeout:
-            log_event({**log_data_base, "event": f"{event_prefix}SendFail_Timeout"})
+            log_event({**log_event_base_info, "timestamp": time.time(), "event": f"{event_prefix}SendFail_Timeout"})
         except socket.error as e:
-            log_event({**log_data_base, "event": f"{event_prefix}SendFail_SocketError", "error": str(e)})
+            log_event({**log_event_base_info, "timestamp": time.time(), "event": f"{event_prefix}SendFail_SocketError", "error": str(e)})
         except Exception as e:
-            log_event({**log_data_base, "event": f"{event_prefix}SendFail_Unknown", "error": str(e)})
-    else: # Path is closed by schedule
-        log_event_type_blocked = f"{event_prefix}Blocked_TimeWindow"
-        print(f"[{zone_name}] {log_event_type_blocked} chunk {chunk_id} (Ref: {payload_ref})")
-        log_event({**log_data_base, "event": log_event_type_blocked})
+            log_event({**log_event_base_info, "timestamp": time.time(), "event": f"{event_prefix}SendFail_Unknown", "error": str(e)})
+    else: # Path is "closed" by the schedule policy
+        event_type_outcome = f"{event_prefix}Blocked_TimeWindow"
+        log_event({**log_event_base_info, "timestamp": time.time(), "event": event_type_outcome})
 
 
-def run_client(zone_name, target_zone, target_host, target_port, rule, available_data_files):
-    legit_chunk_id_counter = 1
-    rogue_chunk_id_counter = 10000 # Start rogue IDs high to distinguish
-    start_sim_time = time.time()
+def run_client_logic(zone_name_as_client, target_zone_name, target_host_address, target_port_number,
+                     outbound_rule_for_client,
+                     initial_data_files_list,
+                     input_data_queue_from_server_part): # Removed log_event_func, use global
+    legitimate_message_id_counter = 1
+    rogue_message_id_counter = 10000
+    simulation_start_time = time.time()
+    log_event_base_info_client = {"zone": zone_name_as_client, "event_context": "client", "destination": target_zone_name}
 
-    print(f"[{zone_name}] Starting client. Target: {target_zone} ({target_host}:{target_port}). Duration: {TOTAL_DURATION}s. RogueProb: {ROGUE_ATTEMPT_PROBABILITY}")
+    print(f"[{zone_name_as_client}/C] Starting Client Logic. Target: {target_zone_name}. Interval: {CLIENT_REGULAR_SEND_INTERVAL}s. RogueProb: {CLIENT_ROGUE_ATTEMPT_PROBABILITY}", flush=True)
+    is_initial_ingestion_client = zone_name_as_client == "data_ingestion_zone"
 
-    can_send_legit_data = True
-    if zone_name == "data_ingestion_zone" and not available_data_files:
-        print(f"[{zone_name}] No data files for legit sends. Only rogue attempts possible if configured.")
-        can_send_legit_data = False
+    while time.time() - simulation_start_time < CLIENT_TOTAL_DURATION:
+        current_time = datetime.datetime.now()
+        current_second_of_minute = current_time.second
+        
+        payload_for_legitimate_send = None # Dict: {"ref": ..., "size": ..., "type": ...}
 
-
-    while time.time() - start_sim_time < TOTAL_DURATION:
-        # --- Legitimate Attempt ---
-        if can_send_legit_data or zone_name != "data_ingestion_zone": # Allow non-ingestion zones to send placeholder legit data
-            payload_ref = "N/A"
-            payload_size = 0
-            content_type = "generic_summary"
-
-            if zone_name == "data_ingestion_zone" and available_data_files:
-                payload_ref = random.choice(available_data_files)
-                content_type = "raw_forecast_metadata"
-                try: payload_size = os.path.getsize(os.path.join(DATA_FILES_DIR_IN_CONTAINER, payload_ref))
+        if is_initial_ingestion_client:
+            if initial_data_files_list:
+                selected_file = random.choice(initial_data_files_list)
+                file_size = 0; 
+                try: file_size = os.path.getsize(os.path.join(DATA_FILES_DIR_IN_CONTAINER, selected_file)); 
                 except: pass
-            elif zone_name == "forecast_processing_zone":
-                payload_ref = f"proc_summary_{legit_chunk_id_counter}"
-                content_type = "processed_forecast_summary"
-                payload_size = random.randint(100, 500)
-            elif zone_name == "operational_control_zone":
-                payload_ref = f"op_update_{legit_chunk_id_counter}"
-                content_type = "operational_hmi_data"
-                payload_size = random.randint(50, 200)
+                payload_for_legitimate_send = {"ref": selected_file, "size": file_size, "type": "raw_forecast_metadata"}
+        elif input_data_queue_from_server_part: # Chained client
+            try:
+                data_from_server_part = input_data_queue_from_server_part.get_nowait()
+                original_ref = data_from_server_part.get("original_data_reference", "unknown_upstream")
+                payload_for_legitimate_send = {
+                    "ref": f"processed_by_{zone_name_as_client}_from_{original_ref[:20]}",
+                    "size": random.randint(50, 500),
+                    "type": f"{zone_name_as_client}_output"
+                }
+                print(f"[{zone_name_as_client}/C] Got data from internal queue: {payload_for_legitimate_send['ref'][:30]}...", flush=True)
+            except queue.Empty:
+                print(f"[{zone_name_as_client}/C] Input queue empty for legit send.", flush=True) # Can be noisy
+                pass
+        
+        is_my_outbound_window_open_now = False
+        if outbound_rule_for_client:
+            start_sec = outbound_rule_for_client.get("start_sec", 0); end_sec = outbound_rule_for_client.get("end_sec", 60)
+            is_my_outbound_window_open_now = start_sec <= current_second_of_minute < end_sec
 
-            if payload_ref != "N/A": # Ensure there's something to send
-                 attempt_send(zone_name, target_zone, target_host, target_port, rule,
-                             legit_chunk_id_counter, payload_ref, payload_size, content_type,
-                             is_rogue_attempt=False)
-                 legit_chunk_id_counter += 1
-
-        # --- Rogue Attempt (Probabilistic) ---
-        if random.random() < ROGUE_ATTEMPT_PROBABILITY:
-            rogue_payload_ref = f"rogue_data_{rogue_chunk_id_counter}"
-            rogue_payload_size = random.randint(10, 1000) # Rogue payload can be anything
-            rogue_content_type = "rogue_exfiltration_attempt"
-            attempt_send(zone_name, target_zone, target_host, target_port, rule,
-                         rogue_chunk_id_counter, rogue_payload_ref, rogue_payload_size, rogue_content_type,
-                         is_rogue_attempt=True)
-            rogue_chunk_id_counter += 1
-
-        time.sleep(REGULAR_SEND_INTERVAL)
-
-    log_event({"timestamp": time.time(), "zone": zone_name, "event": "ClientFinished"})
-
-
-if __name__ == "__main__":
-    zone_name = os.getenv('ZONE_NAME')
-    if not zone_name: exit(1)
-
-    try:
-        with open(SCHEDULE_FILE, 'r') as f: schedule_data = json.load(f)
-    except Exception: exit(1)
-
-    available_files = []
-    if zone_name == "data_ingestion_zone":
-        available_files = get_available_data_files()
-        print(f"[{zone_name}] Found {len(available_files)} data files in {DATA_FILES_DIR_IN_CONTAINER}.")
-
-    client_rule, target_zone_name, target_host_name, target_port_num = None, None, None, None
-    my_role_info = schedule_data.get("zones", {}).get(zone_name, {})
-
-    if my_role_info.get("role") in ["client", "server_client"]:
-        target_zone_name = my_role_info.get("target")
-        if target_zone_name:
-            target_host_name = target_zone_name
-            for r in schedule_data.get("rules", []):
-                if r.get("source") == zone_name and r.get("destination") == target_zone_name:
-                    client_rule = r
-                    target_port_num = r.get("port")
-                    break
+        if payload_for_legitimate_send:
+            if is_my_outbound_window_open_now:
+                client_attempt_send(zone_name_as_client, target_zone_name, target_host_address, target_port_number,
+                                    outbound_rule_for_client, legitimate_message_id_counter,
+                                    payload_for_legitimate_send["ref"], payload_for_legitimate_send["size"],
+                                    payload_for_legitimate_send["type"], is_rogue_attempt=False)
+                legitimate_message_id_counter += 1
+            else:
+                log_event({
+                    **log_event_base_info_client, "timestamp": time.time(), "event": "LegitSend_Held_ClientAwareWindowClosed",
+                    "message_id": legitimate_message_id_counter, "payload_reference": payload_for_legitimate_send["ref"],
+                    "current_second": current_second_of_minute, "is_rogue_attempt": False,
+                    "scheduled_window_for_path": f"{outbound_rule_for_client.get('start_sec','N/A')}-{outbound_rule_for_client.get('end_sec','N/A')-1}" if outbound_rule_for_client else "N/A"
+                })
+                if input_data_queue_from_server_part and 'data_from_server_part' in locals() and data_from_server_part:
+                    try: input_data_queue_from_server_part.put_nowait(data_from_server_part) # Put it back
+                    except queue.Full:
+                         log_event({**log_event_base_info_client, "timestamp": time.time(), "event": "LegitSend_ReQueueFail_Full", "message_id": legitimate_message_id_counter})
+        
+        if random.random() < CLIENT_ROGUE_ATTEMPT_PROBABILITY:
+            client_attempt_send(zone_name_as_client, target_zone_name, target_host_address, target_port_number,
+                                outbound_rule_for_client, rogue_message_id_counter,
+                                f"rogue_payload_{rogue_message_id_counter}", random.randint(10, 1000),
+                                "rogue_generated_data", is_rogue_attempt=True)
+            rogue_message_id_counter += 1
+        
+        time.sleep(CLIENT_REGULAR_SEND_INTERVAL)
     
-    if client_rule and target_port_num:
-        run_client(zone_name, target_zone_name, target_host_name, target_port_num, client_rule, available_files)
-    else:
-        print(f"[{zone_name}] No client rule or target. Idling.")
-        log_event({"timestamp": time.time(), "zone": zone_name, "event": "ClientNotStarted_NoConfig"})
-        while True: time.sleep(60)
+    log_event({**log_event_base_info_client, "timestamp": time.time(), "event": "ClientPartFinished"})
+    print(f"[{zone_name_as_client}/C] Client part finished its run duration.", flush=True)
+
+# The rest of zone_agent.py (main block, server logic) would integrate these functions.
+# For example, in the __main__ of zone_agent.py:
+#
+# if role in ["client", "server_client"]:
+#    # ... (determine target_zone_name, target_host_address, etc. and outbound_rule_for_client) ...
+#    initial_files = get_initial_data_files_for_ingestion(zone_name)
+#    client_thread = threading.Thread(
+#        target=run_client_logic,
+#        args=(zone_name, target_zone_name, target_host_address, target_port_number,
+#              outbound_rule_for_client, initial_files, internal_data_queue_for_client_part, # Pass the queue here
+#              log_event), # Pass the actual log_event function
+#        daemon=True
+#    )
+#    threads.append(client_thread)
+#    client_thread.start()
