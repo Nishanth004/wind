@@ -1,0 +1,6 @@
+# requirements.txt
+matplotlib
+cfgrib 
+xarray 
+cartopy 
+requests
