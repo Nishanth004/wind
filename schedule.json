@@ -1,0 +1,31 @@
+{
+    "zones": {
+      "data_ingestion_zone": {"role": "client", "target": "forecast_processing_zone"},
+      "forecast_processing_zone": {"role": "server_client", "listen_source": "data_ingestion_zone", "target": "operational_control_zone"},
+      "operational_control_zone": {"role": "server_client", "listen_source": "forecast_processing_zone", "target": "scada_presentation_zone"},
+      "scada_presentation_zone": {"role": "server", "listen_source": "operational_control_zone"}
+    },
+    "rules": [
+      {
+        "source": "data_ingestion_zone",
+        "destination": "forecast_processing_zone",
+        "port": 20001,
+        "comment": "Forecast data ingestion",
+        "start_sec": 5,  "end_sec": 15  
+      },
+      {
+        "source": "forecast_processing_zone",
+        "destination": "operational_control_zone",
+        "port": 20002,
+        "comment": "Processed forecast to operations",
+        "start_sec": 25, "end_sec": 30 
+      },
+      {
+        "source": "operational_control_zone",
+        "destination": "scada_presentation_zone",
+        "port": 20003,
+        "comment": "Operational data to HMI/Historian",
+        "start_sec": 40, "end_sec": 55 
+      }
+    ]
+  }
