@@ -1,25 +1,29 @@
 import json
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 import matplotlib.patches as patches
-import matplotlib.dates as mdates # For proper date formatting on timeline
+import matplotlib.dates as mdates
 import os
 import time
 import datetime
-import pandas as pd # For easier data handling and time conversions
+import pandas as pd
 from collections import defaultdict
 import numpy as np
+import argparse
 
+# --- Configuration ---
 LOG_FILE = "./logs/simulation.log"
 SCHEDULE_FILE = "schedule.json"
-UPDATE_INTERVAL = 3000 # Milliseconds (3 seconds for updates)
-# To select a specific path to visualize, or set to None to iterate/prompt
-# PATH_TO_VISUALIZE_EXPLICITLY = "data_ingestion_zone -> forecast_processing_zone"
-PATH_TO_VISUALIZE_EXPLICITLY = "data_ingestion_zone -> forecast_processing_zone"
+PATH_TO_VISUALIZE_EXPLICITLY = "operational_control_zone -> scada_presentation_zone" # Default path to plot
+
+PLOT_OUTPUT_DIR = "visualization_output" # New directory for output plots
 
 log_data_global = []
-last_log_mtime_global = 0
 schedule_rules_global = {}
+
+def ensure_dir(directory_path):
+    if not os.path.exists(directory_path):
+        os.makedirs(directory_path)
+        print(f"Created directory: {directory_path}")
 
 def load_schedule():
     global schedule_rules_global
@@ -28,7 +32,7 @@ def load_schedule():
         parsed_rules = {}
         for rule in schedule_config.get("rules", []):
             key = (rule.get("source"), rule.get("destination"))
-            if rule.get("start_sec") is not None and rule.get("end_sec") is not None: # Ensure rule is complete
+            if rule.get("start_sec") is not None and rule.get("end_sec") is not None:
                 parsed_rules[key] = {"start_sec": int(rule["start_sec"]), "end_sec": int(rule["end_sec"]), "port": rule.get("port")}
         schedule_rules_global = parsed_rules
         print(f"[VISUALIZER_HOST] Loaded {len(schedule_rules_global)} valid schedule rules.")
@@ -36,42 +40,40 @@ def load_schedule():
         print(f"[VISUALIZER_HOST] Error loading schedule: {e}")
 
 def read_all_logs():
-    global log_data_global, last_log_mtime_global
+    global log_data_global
     try:
         if not os.path.exists(LOG_FILE):
-            # print("[VISUALIZER_HOST] Log file not found yet.")
-            return False # Indicate no update
-        current_mtime = os.path.getmtime(LOG_FILE)
-        if current_mtime > last_log_mtime_global or not log_data_global:
-            temp_data = []
-            with open(LOG_FILE, 'r') as f:
-                for line_num, line in enumerate(f):
-                    try:
-                        entry = json.loads(line.strip())
-                        # Convert timestamp to datetime object early
-                        if 'timestamp' in entry:
-                            entry['datetime'] = pd.to_datetime(entry['timestamp'], unit='s')
-                        temp_data.append(entry)
-                    except json.JSONDecodeError:
-                        print(f"[VISUALIZER_HOST] Warning: Skipping malformed JSON line {line_num+1}: {line.strip()}")
-            log_data_global = temp_data
-            last_log_mtime_global = current_mtime
-            print(f"[VISUALIZER_HOST] Loaded {len(log_data_global)} log entries.")
-            return True # Indicate update
-    except FileNotFoundError: pass
-    except Exception as e: print(f"[VISUALIZER_HOST] Error reading log file: {e}")
+            print("[VISUALIZER_HOST] Log file not found yet. Cannot generate plots.")
+            return False
+        
+        temp_data = []
+        with open(LOG_FILE, 'r') as f:
+            for line_num, line in enumerate(f):
+                try:
+                    entry = json.loads(line.strip())
+                    if 'timestamp' in entry:
+                        entry['datetime'] = pd.to_datetime(entry['timestamp'], unit='s')
+                    temp_data.append(entry)
+                except json.JSONDecodeError:
+                    print(f"[VISUALIZER_HOST] Warning: Skipping malformed JSON line {line_num+1}: {line.strip()}")
+        log_data_global = temp_data
+        print(f"[VISUALIZER_HOST] Loaded {len(log_data_global)} log entries.")
+        return True
+    except FileNotFoundError:
+        print(f"[VISUALIZER_HOST] Log file '{LOG_FILE}' not found.")
+    except Exception as e:
+        print(f"[VISUALIZER_HOST] Error reading log file: {e}")
     return False
-
 
 def aggregate_data_by_path(current_log_data):
     stats_by_path = defaultdict(lambda: {
         "legit_attempt_count": 0, "legit_success_count": 0, "legit_held_window_closed_count":0,
-        "legit_blocked_by_firewall_count": 0, # Legit attempt that hit a closed window at firewall
+        "legit_blocked_by_firewall_count": 0,
         "rogue_attempt_count": 0, "rogue_success_breach_count": 0,
-        "rogue_blocked_by_firewall_win_count": 0, # Rogue attempt blocked by firewall
-        "legit_fails_comm_count":0, "rogue_fails_comm_count":0, # timeouts, socket errors after allowed by firewall
+        "rogue_blocked_by_firewall_win_count": 0,
+        "legit_fails_comm_count":0, "rogue_fails_comm_count":0,
         "legit_success_latencies": [], "rogue_success_latencies": [],
-        "timeline_events": [] # (datetime, event_short_type, is_rogue, success_state)
+        "timeline_events": []
     })
 
     if not current_log_data: return stats_by_path
@@ -86,11 +88,8 @@ def aggregate_data_by_path(current_log_data):
         if not source_zone or not dest_zone or not dt_obj: continue
 
         path_key = f"{source_zone} -> {dest_zone}"
-        s = stats_by_path[path_key] # s for path_stats
+        s = stats_by_path[path_key]
 
-        # Timeline event structure: (datetime, y_category, marker_style, color, label_for_legend)
-        # Success states: 0=Fail/Blocked, 1=Success, 2=Held/Attempt
-        
         if event == "AttemptSend" or event == "RogueAttemptSend":
             if is_rogue: s["rogue_attempt_count"] += 1
             else: s["legit_attempt_count"] += 1
@@ -108,65 +107,53 @@ def aggregate_data_by_path(current_log_data):
 
         elif event == "Blocked_TimeWindow" or event == "RogueBlocked_TimeWindow":
             if is_rogue: s["rogue_blocked_by_firewall_win_count"] += 1
-            else: s["legit_blocked_by_firewall_count"] += 1 # Legit attempt made when path was closed
+            else: s["legit_blocked_by_firewall_count"] += 1
             s["timeline_events"].append({'dt': dt_obj, 'type': 'BlockedFW', 'rogue': is_rogue, 'success_state': 0, 'latency': None})
         
         elif event == "LegitSend_Held_ClientAwareWindowClosed":
             s["legit_held_window_closed_count"] +=1
             s["timeline_events"].append({'dt': dt_obj, 'type': 'HeldClient', 'rogue': False, 'success_state': 2, 'latency': None})
 
-        elif "SendFail" in event: # Catches Timeout, SocketError, BadAck, Unknown
+        elif "SendFail" in event:
             if is_rogue: s["rogue_fails_comm_count"] += 1
             else: s["legit_fails_comm_count"] += 1
             s["timeline_events"].append({'dt': dt_obj, 'type': 'FailComm', 'rogue': is_rogue, 'success_state': 0, 'latency': None})
-
 
     for path_key in stats_by_path:
         stats_by_path[path_key]["timeline_events"].sort(key=lambda x: x['dt'])
     return stats_by_path
 
-
-def animate(i, fig, selected_path_key_ref): # Pass selected_path_key as a mutable reference (list)
-    if read_all_logs() or not fig.axes: # Force redraw if logs updated or first run
-        pass # Continue to redraw
-    elif i == 0 and not fig.axes: # First call, no axes yet
-        pass
-    # else: # No log update and not first call, potentially skip redraw
-    #     return [artist for ax in fig.axes for artist in ax.get_children()]
-
+def generate_plots_and_save(selected_path_key, output_dir, start_time_arg=None, end_time_arg=None):
+    ensure_dir(output_dir)
+    load_schedule()
+    if not read_all_logs():
+        print("Exiting: No log data available for plotting.")
+        return
 
     stats_by_path_agg = aggregate_data_by_path(log_data_global)
-    fig.clf() # Clear previous drawing
 
     if not stats_by_path_agg:
-        ax_empty = fig.add_subplot(1,1,1)
-        ax_empty.text(0.5, 0.5, 'Waiting for log data or no communication paths found...', ha='center', va='center')
-        return [ax_empty]
+        print("No aggregated data to plot.")
+        return
 
-    # Determine which path to plot
-    current_path_to_plot = selected_path_key_ref[0]
-    if current_path_to_plot is None or current_path_to_plot not in stats_by_path_agg:
-        current_path_to_plot = next(iter(stats_by_path_agg)) # Default to first available path
+    if selected_path_key is None or selected_path_key not in stats_by_path_agg:
+        print(f"Warning: Specified path '{selected_path_key}' not found or not provided. Defaulting to first available path.")
+        selected_path_key = next(iter(stats_by_path_agg))
 
-    stats = stats_by_path_agg[current_path_to_plot]
-    source_name_viz, dest_name_viz = current_path_to_plot.split(" -> ")
+    stats = stats_by_path_agg[selected_path_key]
+    source_name_viz, dest_name_viz = selected_path_key.split(" -> ")
     
-    # --- Overall Title ---
-    fig.suptitle(f"Time-Based SCADA Segmentation: {current_path_to_plot}", fontsize=16, y=0.99)
-    gs = fig.add_gridspec(2, 2, height_ratios=[1, 1.5]) # Let constrained_layout handle spacing
-
-    # --- 1. Detailed Pie Chart ---
-    ax1 = fig.add_subplot(gs[0, 0])
+    # --- Plot 1: Detailed Pie Chart ---
+    fig1, ax1 = plt.subplots(figsize=(14, 12)) # Pie chart figure size
     pie_labels = ['Rogue Blocked (Win)', 'Rogue Success (Breach)', 'Rogue Comm.Fail']
     pie_sizes = [
-    stats["rogue_blocked_by_firewall_win_count"],
-    stats["rogue_success_breach_count"],
-    stats["rogue_fails_comm_count"]
-        ]
-    pie_colors = ['darkred', 'orange', 'dimgrey']
-    pie_explode = [0.05 if s > 0 else 0 for s in pie_sizes] # Explode successful slices
+        stats["rogue_blocked_by_firewall_win_count"],
+        stats["rogue_success_breach_count"],
+        stats["rogue_fails_comm_count"]
+    ]
+    pie_colors = ['darkred', 'gold', 'dimgrey']
+    pie_explode = [0.05 if s > 0 else 0 for s in pie_sizes]
 
-    # Filter out zero-value slices for cleaner pie chart
     valid_indices = [idx for idx, size in enumerate(pie_sizes) if size > 0]
     labels_f = [pie_labels[i] for i in valid_indices]
     sizes_f = [pie_sizes[i] for i in valid_indices]
@@ -176,17 +163,18 @@ def animate(i, fig, selected_path_key_ref): # Pass selected_path_key as a mutabl
     if sizes_f:
         ax1.pie(sizes_f, labels=labels_f, colors=colors_f, autopct=lambda p: '{:.1f}% ({:.0f})'.format(p, p * sum(sizes_f) / 100),
                 startangle=90, explode=explode_f if any(e > 0 for e in explode_f) else None,
-                wedgeprops={'edgecolor': 'white', 'linewidth': 0.5}, pctdistance=0.80, textprops={'fontsize': 8})
+                wedgeprops={'edgecolor': 'white', 'linewidth': 0.5}, pctdistance=0.75, textprops={'fontsize': 18}) # Pie chart percentage/label font size
     else:
-        ax1.text(0.5, 0.5, 'No data for pie chart', ha='center', va='center')
-    total_legit = stats["legit_attempt_count"] + stats["legit_held_window_closed_count"] # attempts + holds
-    total_rogue = stats["rogue_attempt_count"]
-    ax1.set_title(f"Rogue Attempt Outcomes for {current_path_to_plot}\n(Total Rogue Attempts: {stats['rogue_attempt_count']})", fontsize=10)    
+        ax1.text(0.5, 0.5, 'No data for pie chart', ha='center', va='center', fontsize=20) # "No data" message font size
+    ax1.set_title(f"Rogue Attempt Outcomes for {selected_path_key}\n(Total Rogue Attempts: {stats['rogue_attempt_count']})", fontsize=22) # Pie chart title font size
     ax1.axis('equal')
+    plt.tight_layout()
+    fig1.savefig(os.path.join(output_dir, f"pie_chart_{selected_path_key.replace(' -> ', '_')}.png"), dpi=300)
+    plt.close(fig1)
+    print(f"Saved pie chart for {selected_path_key}")
 
-
-    # --- 2. Latency Distribution ---
-    ax2 = fig.add_subplot(gs[0, 1])
+    # --- Plot 2: Latency Distribution ---
+    fig2, ax2 = plt.subplots(figsize=(14, 12)) # Latency plot figure size
     combined_latencies = []
     latency_labels = []
     latency_colors = []
@@ -200,136 +188,184 @@ def animate(i, fig, selected_path_key_ref): # Pass selected_path_key as a mutabl
         latency_colors.append('lightcoral')
 
     if combined_latencies:
-        ax2.hist(combined_latencies, bins=15, label=latency_labels, color=latency_colors, edgecolor='black', stacked=False) # Can set stacked=True
-        ax2.legend(fontsize='small')
-        # Add overall average if meaningful
+        ax2.hist(combined_latencies, bins=20, label=latency_labels, color=latency_colors, edgecolor='black', stacked=False, alpha=0.8)
+        ax2.legend(fontsize=18) # Latency plot legend font size
         all_lats = [l for sublist in combined_latencies for l in sublist]
         if all_lats:
-             ax2.axvline(np.mean(all_lats), color='red', linestyle='dashed', linewidth=1, label=f'Overall Avg: {np.mean(all_lats):.1f}ms')
+             ax2.axvline(np.mean(all_lats), color='red', linestyle='dashed', linewidth=1.5, label=f'Overall Avg: {np.mean(all_lats):.1f}ms')
     else:
-        ax2.text(0.5, 0.5, 'No successful sends with latency data', ha='center', va='center')
-    ax2.set_title('Latency Distribution for Successful Sends', fontsize=10)
-    ax2.set_xlabel('Round Trip Time (ms)', fontsize=9)
-    ax2.set_ylabel('Frequency', fontsize=9)
-    ax2.xaxis.label.set_visible(True)
-    ax2.tick_params(axis='x', labelbottom=True) # Force tick labels
+        ax2.text(0.5, 0.5, 'No successful sends with latency data', ha='center', va='center', fontsize=20) # "No data" message font size
+    ax2.set_title(f'Latency Distribution for Successful Sends ({selected_path_key})', fontsize=22) # Latency plot title font size
+    ax2.set_xlabel('Round Trip Time (ms)', fontsize=20) # X-axis label font size
+    ax2.set_ylabel('Frequency', fontsize=20) # Y-axis label font size
+    ax2.tick_params(axis='x', labelbottom=True, labelsize=18) # X-axis tick labels font size
+    ax2.tick_params(axis='y', labelsize=18) # Y-axis tick labels font size
+    ax2.grid(True, linestyle=':', alpha=0.7)
+    plt.tight_layout()
+    fig2.savefig(os.path.join(output_dir, f"latency_dist_{selected_path_key.replace(' -> ', '_')}.png"), dpi=300)
+    plt.close(fig2)
+    print(f"Saved latency distribution for {selected_path_key}")
 
-
-
-    # --- 3. Event Timeline with Scheduled Windows ---
-    ax3 = fig.add_subplot(gs[1, :]) # Span bottom row
+    # --- Plot 3: Event Timeline with Scheduled Windows ---
+    fig3, ax3 = plt.subplots(figsize=(24, 16)) # Timeline plot figure size
     path_schedule_info = schedule_rules_global.get((source_name_viz, dest_name_viz))
 
     if stats["timeline_events"]:
         timeline_df = pd.DataFrame(stats["timeline_events"])
-        min_time_dt = timeline_df['dt'].min()
-        max_time_dt = timeline_df['dt'].max()
+        
+        # Determine time window for the plot
+        if start_time_arg and end_time_arg:
+            plot_start_time = pd.to_datetime(start_time_arg)
+            plot_end_time = pd.to_datetime(end_time_arg)
+        else:
+            min_time_dt = timeline_df['dt'].min()
+            max_time_dt = timeline_df['dt'].max()
+            plot_start_time = min_time_dt.floor('min') - pd.Timedelta(seconds=5) if pd.notna(min_time_dt) else None
+            plot_end_time = max_time_dt.ceil('min') + pd.Timedelta(seconds=5) if pd.notna(max_time_dt) else None
 
-        # Plot scheduled windows as background
-        if path_schedule_info and pd.notna(min_time_dt) and pd.notna(max_time_dt):
-            plot_start_time = min_time_dt.floor('min') #- pd.Timedelta(seconds=10) # Add padding
-            plot_end_time = max_time_dt.ceil('min') #+ pd.Timedelta(seconds=10)   # Add padding
+        if plot_start_time and plot_end_time:
             ax3.set_xlim(plot_start_time, plot_end_time)
 
-            current_minute_iter = plot_start_time
-            while current_minute_iter <= plot_end_time:
-                win_start_dt = current_minute_iter + pd.Timedelta(seconds=path_schedule_info['start_sec'])
-                win_end_dt = current_minute_iter + pd.Timedelta(seconds=path_schedule_info['end_sec'])
-                ax3.add_patch(patches.Rectangle((win_start_dt, -0.5), win_end_dt - win_start_dt,
-                                                5, # Height of rect to cover y-categories
-                                                facecolor='gainsboro', alpha=0.4, edgecolor='darkgrey', linewidth=0.5, zorder=0, label='_nolegend_'))
-                current_minute_iter += pd.Timedelta(minutes=1)
-        
-        # Y-categories for timeline events
-        y_categories = {
-            'Attempt': 0, 'HeldClient': 0.8, 'BlockedFW': 1.6, 'FailComm': 2.4, 'Success': 3.2
-        } # Base Y for legit, rogue will be offset
-        y_rogue_offset = 0.25 # Offset rogue events slightly on Y for visibility
+            # Plot scheduled windows as background
+            if path_schedule_info:
+                current_minute_iter = plot_start_time.replace(second=0, microsecond=0)
+                if current_minute_iter > plot_start_time:
+                     current_minute_iter = current_minute_iter - pd.Timedelta(minutes=1)
 
-        event_styles = { # (marker, size, alpha, zorder, color_map_key)
-            ('Attempt', False): ('o', 15, 0.7, 5, 'attempt_legit'),
-            ('Attempt', True):  ('x', 25, 0.7, 6, 'attempt_rogue'),
-            ('HeldClient', False): ('>', 20, 0.8, 7, 'held_legit'), # Client held it
-            ('BlockedFW', False): ('o', 20, 1, 8, 'blocked_fw_legit'), # FW blocked legit
-            ('BlockedFW', True):  ('x', 35, 1, 9, 'blocked_fw_rogue_WIN'), # FW blocked rogue - SECURITY WIN!
-            ('FailComm', False): ('s', 15, 0.8, 3, 'fail_comm_legit'),
-            ('FailComm', True):  ('P', 25, 0.8, 4, 'fail_comm_rogue'),
-            ('Success', False): ('o', 30, 1, 10, 'success_legit'),
-            ('Success', True):  ('X', 40, 1, 11, 'success_rogue_BREACH'), # Rogue got through - BREACH!
+                while current_minute_iter <= plot_end_time + pd.Timedelta(minutes=1):
+                    win_start_dt = current_minute_iter + pd.Timedelta(seconds=path_schedule_info['start_sec'])
+                    win_end_dt = current_minute_iter + pd.Timedelta(seconds=path_schedule_info['end_sec'])
+                    
+                    rect_start = max(win_start_dt, plot_start_time)
+                    rect_end = min(win_end_dt, plot_end_time)
+                    
+                    if rect_start < rect_end:
+                        ax3.add_patch(patches.Rectangle((rect_start, -0.8), rect_end - rect_start,
+                                                        5, # Height of rect to cover y-categories
+                                                        facecolor='gainsboro', alpha=0.4, edgecolor='darkgrey', linewidth=0.5, zorder=0, label='_nolegend_'))
+                    current_minute_iter += pd.Timedelta(minutes=1)
+        
+        # ACTIVE Y-CATEGORIES FOR THE TIMELINE (COMPRESSED)
+        y_categories = {
+            'Attempt': 0,
+            'BlockedFW': 0.5, # Reduced spacing
+            'Success': 1.0    # Reduced spacing
         }
+        y_rogue_offset = 0.2 # Reduced offset for vertical separation between L and R
+
+        # (marker, size, alpha, zorder, color_map_key, scatter_line_width, scatter_edge_color, legend_line_width)
+        # ACTIVE EVENT STYLES (markersizes increased for clarity)
+        event_styles = { 
+            ('Attempt', False): ('o', 55, 0.7, 5, 'attempt_legit', 0.8, 'black', 0.8),
+            ('Attempt', True):  ('x', 65, 0.7, 6, 'attempt_rogue', 2.5, None, 2.5),
+            ('BlockedFW', False): ('o', 60, 1, 8, 'blocked_fw_legit', 0.8, 'black', 0.8),
+            ('BlockedFW', True):  ('x', 75, 1, 9, 'blocked_fw_rogue_WIN', 3.0, None, 3.0),
+            ('Success', False): ('o', 70, 1, 10, 'success_legit', 0.8, 'black', 0.8),
+            ('Success', True):  ('X', 80, 1, 11, 'success_rogue_BREACH', 3.0, None, 3.0),
+        }
+        # ACTIVE COLOR MAP
         color_map = {
-            'attempt_legit': 'blue', 'attempt_rogue': 'lightblue',
-            'held_legit': 'skyblue',
+            'attempt_legit': 'blue',
+            'attempt_rogue': 'darkorange',
             'blocked_fw_legit': 'lightcoral', 'blocked_fw_rogue_WIN': 'darkred',
-            'fail_comm_legit': 'grey', 'fail_comm_rogue': 'dimgrey',
-            'success_legit': 'green', 'success_rogue_BREACH': 'orange',
+            'success_legit': 'green', 'success_rogue_BREACH': 'gold',
         }
 
         # Plot events
         for _, event_row in timeline_df.iterrows():
+            if plot_start_time and plot_end_time and not (plot_start_time <= event_row['dt'] <= plot_end_time):
+                continue
+
+            if event_row['type'] not in y_categories:
+                continue
+
             y_base = y_categories.get(event_row['type'], -1)
             style_key = (event_row['type'], event_row['rogue'])
-            marker, size, alpha, z, color_key = event_styles.get(style_key, ('D',10,0.5,1,'default_black'))
+            
+            if style_key not in event_styles:
+                continue
+
+            marker, size, alpha, z, color_key, lw_scatter, ec_scatter, _ = event_styles[style_key]
             color = color_map.get(color_key,'black')
             
             y_val = y_base + y_rogue_offset if event_row['rogue'] else y_base
-            ax3.scatter(event_row['dt'], y_val, marker=marker, s=size, alpha=alpha, color=color, zorder=z, edgecolors='black', linewidths=0.3)
+            ax3.scatter(event_row['dt'], y_val, marker=marker, s=size, alpha=alpha, color=color, zorder=z,
+                        edgecolors=ec_scatter if ec_scatter else color,
+                        linewidths=lw_scatter)
 
-        # Setup Y-axis labels from categories
         y_ticks = []
         y_tick_labels = []
-        for cat, y_base_val in y_categories.items():
+        for cat, y_base_val in y_categories.items(): # Loop only through the active categories
             y_ticks.extend([y_base_val, y_base_val + y_rogue_offset])
-            y_tick_labels.extend([f"L: {cat}", f"R: {cat}"])
-        # Sort them by y_value for correct display
+            y_tick_labels.extend([f"L: {cat.replace('BlockedFW', 'Blocked by FW')}",
+                                  f"R: {cat.replace('BlockedFW', 'Blocked by FW')}"])
         sorted_y_display = sorted(zip(y_ticks, y_tick_labels), key=lambda x: x[0])
         ax3.set_yticks([item[0] for item in sorted_y_display])
-        ax3.set_yticklabels([item[1] for item in sorted_y_display], fontsize=7)
-        ax3.set_ylim(-0.6, max(y_categories.values()) + y_rogue_offset + 0.6)
+        ax3.set_yticklabels([item[1] for item in sorted_y_display], fontsize=22) # Y-axis tick labels font size (increased)
+        
+        # Tightly set Y-axis limits based on actual plotted range
+        min_y_val = min(y_categories.values())
+        max_y_val = max(y_categories.values()) + y_rogue_offset
+        ax3.set_ylim(min_y_val - 0.2, max_y_val + 0.2) # Adjusted limits for minimal padding
 
-        # Format X-axis for time
         ax3.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
-        fig.autofmt_xdate(rotation=30, ha='right')
-        ax3.set_xlabel('Time (Simulation Clock)', fontsize=9)
-        ax3.set_ylabel('Event Type (L: Legit, R: Rogue)', fontsize=9)
-        ax3.tick_params(axis='x', which='major', labelsize=8)
+        fig3.autofmt_xdate(rotation=30, ha='right')
+        ax3.set_xlabel('Time (Simulation Clock)', fontsize=24) # X-axis label font size
+        ax3.set_ylabel('Event Type (L: Legit, R: Rogue)', fontsize=24) # Y-axis label font size
+        ax3.tick_params(axis='x', which='major', labelsize=20) # X-axis tick labels font size
+        ax3.tick_params(axis='y', which='major', labelsize=20) # Y-axis tick labels font size
         ax3.grid(True, axis='y', linestyle=':', linewidth=0.5)
-        ax3.set_title('Detailed Event Timeline (Shaded: Scheduled Open Windows for Path)', fontsize=10)
+        ax3.set_title(f'Detailed Event Timeline for {selected_path_key} ', fontsize=28) # Timeline plot title font size
 
-        # Custom Legend for Timeline
         legend_handles = []
-        # Base legend for scheduled window
         legend_handles.append(patches.Patch(facecolor='gainsboro', alpha=0.4, edgecolor='darkgrey', label='Scheduled Open Window'))
-        # Event specific legends
-        unique_styles_for_legend = {} # To avoid duplicate legend entries
-        for (etype, is_r), (m, sz, al, zo, ck) in event_styles.items():
-            label = f"{'Rogue ' if is_r else 'Legit '}{etype.replace('FW','Blocked').replace('Comm','Fail')}"
-            if label not in unique_styles_for_legend:
-                legend_handles.append(plt.Line2D([0], [0], marker=m, color=color_map[ck], linestyle='None', markersize=np.sqrt(sz/2), label=label))
-                unique_styles_for_legend[label] = True
-        ax3.legend(handles=legend_handles, loc='upper center', bbox_to_anchor=(0.5, -0.25), ncol=3, fontsize='x-small', frameon=False)
-
+        
+        unique_styles_for_legend = {}
+        for (etype, is_r), (m, sz, al, zo, ck, lw_s, ec_s, lw_l) in event_styles.items(): # Loop over *active* event styles
+            label_text = ""
+            if etype == 'Attempt':
+                label_text = f"{'Rogue' if is_r else 'Legit'} Attempt"
+            elif etype == 'BlockedFW':
+                label_text = f"{'Rogue' if is_r else 'Legit'} Blocked by FW"
+                if is_r: label_text += " (Win)"
+            elif etype == 'Success':
+                label_text = f"{'Rogue' if is_r else 'Legit'} Success"
+                if is_r: label_text += " (Breach)"
+            
+            if label_text not in unique_styles_for_legend:
+                legend_markeredgecolor = 'black'
+                if m in ['x', 'X']:
+                    legend_markeredgecolor = color_map[ck]
+                
+                legend_handles.append(plt.Line2D([0], [0], marker=m, color=color_map[ck], linestyle='None',
+                                                 markersize=np.sqrt(sz/2)*1.8, # Legend marker size
+                                                 label=label_text,
+                                                 markeredgewidth=lw_l,
+                                                 markeredgecolor=legend_markeredgecolor))
+                unique_styles_for_legend[label_text] = True
+        
+        ax3.legend(handles=legend_handles, loc='upper center', bbox_to_anchor=(0.5, -0.25), ncol=3, fontsize=26, frameon=False, markerscale=1.5) # Timeline plot legend font size
     else:
-        ax3.text(0.5, 0.5, 'No timeline events for this path', ha='center', va='center')
+        ax3.text(0.5, 0.5, 'No timeline events for this path', ha='center', va='center', fontsize=20) # "No data" message font size
 
-    plt.tight_layout(rect=[0, 0.08, 1, 0.95]) # Adjust layout for suptitle and timeline legend
-    fig.subplots_adjust(hspace=.6)
-    # Return all artists for blitting if used (not fully implemented here for simplicity of full redraw)
-    return [child for ax_child in fig.axes for child in ax_child.get_children()]
-
+    # Adjusted rect for more padding, especially bottom for huge legend
+    plt.tight_layout(rect=[0.04, 0.1, 0.98, 0.95]) # [left, bottom, right, top]
+    fig3.savefig(os.path.join(output_dir, f"timeline_{selected_path_key.replace(' -> ', '_')}.png"), dpi=300)
+    plt.close(fig3)
+    print(f"Saved timeline plot for {selected_path_key}")
 
 if __name__ == "__main__":
-    load_schedule()
-    selected_path_key_ref = [PATH_TO_VISUALIZE_EXPLICITLY] # Use a list to make it mutable for potential future UI interaction
-
-    fig = plt.figure(figsize=(16, 11), constrained_layout=True)
-    #plt.subplots_adjust(hspace=7) # Padding between subplots
-
-
-    # To allow cycling through paths if PATH_TO_VISUALIZE_EXPLICITLY is None
-    # This is conceptual for now, would need a button or key press event in matplotlib
-    # For now, it will default to the first path if None is specified.
+    parser = argparse.ArgumentParser(description="Generate and save SCADA segmentation visualization plots.")
+    parser.add_argument("--path", type=str, default=PATH_TO_VISUALIZE_EXPLICITLY,
+                        help=f"The communication path to visualize (e.g., 'zone_A -> zone_B'). Default: '{PATH_TO_VISUALIZE_EXPLICITLY}'")
+    parser.add_argument("--output_dir", type=str, default=PLOT_OUTPUT_DIR,
+                        help=f"Directory to save the generated plots. Default: '{PLOT_OUTPUT_DIR}'")
+    parser.add_argument("--start_time", type=str,
+                        help="Start time for the timeline plot (e.g., '2025-05-07 18:25:00').")
+    parser.add_argument("--end_time", type=str,
+                        help="End time for the timeline plot (e.g., '2025-05-07 18:30:00').")
     
-    ani = FuncAnimation(fig, animate, fargs=(fig, selected_path_key_ref,), interval=UPDATE_INTERVAL, cache_frame_data=False, repeat=False)
-    plt.show()
-    print("[VISUALIZER_HOST] Plot window closed.")
+    args = parser.parse_args()
+
+    generate_plots_and_save(args.path, args.output_dir, args.start_time, args.end_time)
+    print("All plots generated and saved.")
