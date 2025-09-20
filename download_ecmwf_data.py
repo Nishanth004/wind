@@ -69,7 +69,7 @@ def main():
     # Or you can specify a date: target_date = datetime.date(2025, 5, 6)
     target_date = datetime.datetime.utcnow().date()
     date_str = target_date.strftime("%Y%m%d")
-    date_str = 20250507 # For testing, set a specific date
+    date_str = 20250820 # For testing, set a specific date
     print(f"Targeting forecast date: {date_str}")
 
     download_count = 0
